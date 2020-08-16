@@ -107,7 +107,7 @@ impl Node for DenseLayer {
         let error_matrix = Array::from_shape_vec((error.dimensions[0], error.dimensions[1]), error_array).unwrap();
         
 
-        let deltas = (error_matrix * derivative_of_output_matrix);
+        let deltas = error_matrix * derivative_of_output_matrix;
         let next_error = weight_matrix.dot(&deltas.t()).reversed_axes();
 
         //Convert it into a flat array for storing
@@ -143,68 +143,120 @@ impl Conv2d {
 
         }
     }
-}
-fernal size 
 
-impl Node for Conv2d {
-    fn forward(weight_tokens: Vec<&WeightToken>, weight_store: &mut WeightStore) -> Vec<WeightToken> {
-        //the weights for the filters, they are form, number of filters, channels, height, weight
-        let filter_weights_token = weight_tokens[0];
-        let input_weight_token = weight_token[1];
+    fn break_up_image_by_channels_and_store(image_with_channels: &WeightToken, weight_store: &mut WeightStore) -> Vec<WeightToken> {
+        let full_image = weight_store.get_weights(&image_with_channels);
 
-        //Get the weights from the store
-        let filter_weight_array = weight_store.get_weights(filter_weights_token);
-        let input_weight_array = weight_store.get_weights(input_weight_token);
-
-        //turn them into the Ndarray Matrix for easy matrix math operations
-        let filter_weight_shape_tuple = (filter_weight_array.dimensions[0], filter_weight_array.dimensions[1], filter_weight_array.dimensions[2], filter_weight_array.dimensions[3]);
-        let filter_weight_matrix = Array::<f32>::from_shape_vec(filter_weight_shape_tuple, filter_weight_array);
-
-        let input_weights_tuple = (input_weight_token.dimensions[0], input_weight_token.dimensions[1], input_weight_token.dimensions[2]);
-        let input_weight_matrix = Array::<f32>::from_shape_vec(input_weights_tuple, input_weight_array);
-
-        //The size of the filter is the height and width, which are stored as part of the dimensions of the entire
-        //filter weight block, number of filters, channels(EG, RGB for an image), height, weight
-        let filter_and_window_size = (filter_weights_token.dimensions[2], filter_weights_token.dimensions[3]);
-        let number_of_filters = filter_weights_token.dimensions[0];
-        let number_of_channels = filter_weights_token.dimensions[1];
-
-        //We will do this one filter at a time
-        for filter_index in 0..number_of_filters {
-            //Ndarray does not let us to dot product operations with 3D matricies, 
-            //so we will break it down once more by the number of channels
-
-            let filter_with_channel = filter_weight_matrix[filter_index];
-            for channel_index in 0..number_of_channels {
-                let filter = filter_with_channel[channel_index];
-                let windows = input_weight_matrix.windows((self.filter_size.0, self.filter_size.1, 1, 1)); 
-            }
+        //The dimensions of the stored weights is, (channels, width, height)
+        let image_size = image_with_channels.dimensions[1] * image_with_channels.dimensions[2];
+        let chunks = full_image.chunks(image_size as usize);
+        let mut weight_tokens = vec![];
+        for c in chunks {
+            let as_vec = c.to_vec();
+            weight_tokens.push(weight_store.add_weights(as_vec, vec![image_with_channels.dimensions[1], image_with_channels.dimensions[2]]));
         }
+        return weight_tokens;
     }
 
-    fn single_filter_on_image(filter: WeightToken, ) {
+    fn single_filter_on_image(filter: &WeightToken, image_with_channel: &WeightToken, weight_store: &mut WeightStore) {
+        //This is a channels first library, got a problem with it, go write python
+        let channels = image_with_channel.dimensions[0];
+        let split_up_image = Conv2d::break_up_image_by_channels_and_store(&image_with_channel, weight_store);
+        let split_up_filter = Conv2d::break_up_image_by_channels_and_store(&filter, weight_store);
 
+        let mut convauled_channels = vec![];
+        for i in 0..channels {
+            let convaluted_image = Conv2d::single_image_single_channel_single_filter(&split_up_image[i], &split_up_filter[i], weight_store);
+            convauled_channels.push(convaluted_image);
+        }
+
+        let mut combined_convalted_image = vec![];
+        for i in 0..convauled_channels[0].len() {
+            let mut sum = 0.0;
+            for j in 0..channels {
+                sum += convauled_channels[j][i];
+            }
+            combined_convalted_image.push(sum);
+        }
+        let weight_token = weight_store.add_weights(combined_convalted_image, vec![1, image_with_channel.dimensions[1], image_with_channel.dimensions[2]]);
     }
 
-    fn single_image_single_channel_single_filter(image: WeightToken, filter: WeightToken, weight_store: &mut WeightStore) {
+    fn single_image_single_channel_single_filter(image: &WeightToken, filter: &WeightToken, weight_store: &mut WeightStore) -> Vec<f32> {
         let image_values = weight_store.get_weights(image);
         let filter_values = weight_store.get_weights(filter);
 
         let image_values_dimensions = (image.dimensions[0], image.dimensions[1]);
-        let input_weight_matrix = Array::<f32>::from_shape_vec(image_values_dimensions, image_values);
+        let input_weight_matrix = Array::from_shape_vec(image_values_dimensions, image_values).unwrap();
 
         let filter_values_dimensions = (filter.dimensions[0], filter.dimensions[1]);
-        let filter_weight_matrix = Array::<f32>::from_shape_vec(filter_values_dimensions, filter_values);
+        let filter_weight_matrix = Array::from_shape_vec(filter_values_dimensions, filter_values).unwrap();
 
         let mut results = vec![];
         for f in filter_weight_matrix.windows(image_values_dimensions) {
             let result = f.dot(&input_weight_matrix);
             results.push(result);
         }
+        
+        let mut final_result = vec![];
+        for matrix in results {
+            final_result.extend(matrix.iter().map(|x|*x));
+        }
+        return final_result;
     }
 
-    fn backprop(weight_tokens: Vec<&WeightToken>, weight_store: &mut WeightStore) -> Vec<WeightToken> {
+        //this will remap the image into a array such that it can be dot producted by a similar 
+        //remapped matrix of the filters to preform the conv operation
+        fn remap_image_to_dense(image: WeightToken, filter_dimensions: Vec<usize>, weight_store: &mut WeightStore) -> Vec<WeightToken> {
+            
+            let image_array = weight_store.get_weights(&image);
+            let (height, width) = (image.dimensions[1], image.dimensions[2]);
+            
+            //This will create sub vectors of image channel
+            let channels = image_array.chunks(height * width);
+            for sub_image in channels {
+                //I hate doing this, but I also don't want to figure out the fucking array index math
+                let image_as_matrix = Array::from_shape_vec((height, width), sub_image.to_vec()).unwrap();
+                for w in image_as_matrix.windows((height, width)) {
+                    let s : Vec<f32> = w.iter().map(|x|*x).collect();
+                }
 
+            }
+
+//            for w in 
+            return vec![];
+        }
+    
+}
+
+impl Node for Conv2d {
+
+
+    fn forward(weight_tokens: Vec<&WeightToken>, weight_store: &mut WeightStore) -> Vec<WeightToken> {
+        //the weights for the filters, they are form, number of filters, channels, height, weight
+        let filter_weights_token = weight_tokens[0];
+        let input_weight_token = weight_tokens[1];
+        let filter_weight_array = weight_store.get_weights(&filter_weights_token);
+
+
+        
+
+        let filters = filter_weight_array.chunks(filter_weights_token.dimensions[1] * filter_weights_token.dimensions[2] * filter_weights_token.dimensions[3]);
+        let mut split_up_filters = vec![];
+        for f in filters {
+            let as_vec = f.to_vec();
+            split_up_filters.push(weight_store.add_weights(as_vec, vec![filter_weights_token.dimensions[1], filter_weights_token.dimensions[2], filter_weights_token.dimensions[3]]));
+        }
+        for i in 0..filter_weights_token.dimensions[0] {
+            Conv2d::single_filter_on_image(&split_up_filters[i], input_weight_token, weight_store);
+        }
+
+        return vec![];
+    }
+
+
+
+    fn backprop(weight_tokens: Vec<&WeightToken>, weight_store: &mut WeightStore) -> Vec<WeightToken> {
+        return vec![];
     }
 }
  
