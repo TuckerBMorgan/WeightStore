@@ -57,30 +57,84 @@ impl Conv2d {
         return weight_store.add_weights(stacked_filter_weights, vec![number_of_filters, combined_height_width * number_of_channels]);
     }
 
-    fn remap_filter_output_dervitaive_for_full_convulution_with_filter(fiter: &WeightToken, output_derivative: &WeightToken, weight_store: &mut WeightStore) -> WeightToken {
-        //rotate the filter
-        //zero pad the outuput as part it its remapping
-        let image_size = output_derivative.dimensions[1];
-        let kernel_size = filter.dimensions[2];
-        let image_weights = weight_store.get_weights(filter);
-        //height of the filter + height of the output - 1(they will always overlap by at least one pixel)
-        let extra_size = kernel_size - 1 + image_size;
-        let mut for_windowing = Array::zeros((extra_size, extra_size));
-        for y in 0..image_size {
-            for x in 0..image_size {
-                let one_d_index = x + (y * image_size);
-                let two_d_index = (x + , y + );
-                for_windowing[two_d_index.0][two_d_index.1] = image_weights[one_d_index];
+    //https://medium.com/@pavisj/convolutions-and-backpropagations-46026a8f5d2c
+    fn stuff(kernels: &WeightToken, output_derivative: &WeightToken, weight_store: &mut WeightStore) -> WeightToken { 
+        //write it the bad way you fuck, you have not even done it once
+        //get water + coffee + REDBULL and get this done already
+      
+        //This should be equal to the number of filters in this layer
+        //as each filter should output one of these
+        let number_of_channels_in_output_image = output_derivative.dimensions[0];
+
+        //for now we are ony working with square images
+        //TODO: make this work for now square images
+        let size_of_image = output_derivative.dimensions[1];
+
+        //we lay output kernel dimensions as (number of kernels, number of channels, height, width)
+        let size_of_kernel = kernels.dimensions[2];
+        let extra_size = size_of_kernel - 1 + size_of_image;
+        let number_of_channels = kernels.dimensions[1];
+        let kernels_weights = weight_store.get_weights(kernels);
+        let image_weights = weight_store.get_weights(output_derivative);
+
+        let kernel_matrix = Array::from_shape_vec((kernels.dimensions[0], kernels.dimensions[1], kernels.dimensions[2], kernels.dimensions[2]), kernels_weights).unwrap();
+        let mut rotated_weights : Vec<f32> = vec![];
+        
+        //Loop every kernel by each channel and rotate the kernel 90* this is a cheat for our backprop(in the article at the start of this function)
+        for full_kernel in kernel_matrix.outer_iter() {
+            for sub_kernel in full_kernel.outer_iter() {
+                rotated_weights.append(&mut sub_kernel.t().iter().map(|x|*x).collect());
             }
         }
-        let windows = for_windowing.windows((kernel_size, kernel_size));
-        let mut flattened_windows = vec![];
-        for window in windows {
-            flattened_windows.extend(window.iter());
+
+        let kernel_matrix = Array::from_shape_vec((kernels.dimensions[0], kernels.dimensions[1], kernels.dimensions[2] * kernels.dimensions[2]), rotated_weights).unwrap();
+        let mut kernel_iter = kernel_matrix.outer_iter();
+        let mut sum : Vec<Vec<f32>> = vec![];
+        //We need to preform a full convolution(no reduction in output size) for output channel/kernel pair
+        //the amount of zero padding is the size of the image + twice the extra size to fill with zeros for both 
+        //above and below the image
+        let full_convulutions_size = (extra_size * 2) + size_of_image;
+
+        let size_of_image_with_channels = (size_of_image * size_of_image);
+        for f in 0..number_of_channels_in_output_image {
+            let mut for_windowing = Array::zeros((full_convulutions_size, full_convulutions_size));
+            for y in 0..size_of_image {
+                for x in 0..size_of_image {
+                    //the one d index is the index, in the image weights array
+                    //so it is an offset for what image we are working on(f * )
+                    //then which row(y * size_of_image), and then which col(x)
+                    let one_d_index = (f * size_of_image_with_channels) + (x + (y * size_of_image));
+                    let two_d_index = (y +  size_of_kernel - 1, x + size_of_kernel - 1);
+                    for_windowing[[two_d_index.0, two_d_index.1]] - image_weights[one_d_index];
+                }
+            }
+        
+            let windows = for_windowing.windows((size_of_kernel, size_of_kernel));
+            let mut flattened_windows = vec![];
+            let mut count = 0;
+            for w in windows {
+                count += 1;
+                for v in w {
+                    flattened_windows.push(*v);
+                }
+            }
+
+            let output_image_as_matrix = Array::from_shape_vec((count, (size_of_kernel * size_of_kernel)), flattened_windows).unwrap();
+            let loop_output = output_image_as_matrix.dot(&kernel_iter.next().unwrap());
+            let summed_vector : Vec<f32> = loop_output.iter().map(|x|*x).collect();
+
+            sum.push(summed_vector);
         }
-        return weight_store.add_weights(flattened_windows, vec![extra_size, extra_size]);
+        let mut final_result : Vec<f32> = vec![];
+        for i in 0..sum[0].len() {
+            let mut running_sum = 0.0f32;
+            for j in 0..sum.len() {
+                running_sum += sum[i][j];
+            }
+            final_result.push(running_sum);
+        }
+        return weight_store.add_weights(final_result, vec![number_of_channels, size_of_kernel, size_of_kernel]);
     }
-    
 }
 
 impl Node for Conv2d {
@@ -97,7 +151,6 @@ impl Node for Conv2d {
         let remapped_filters_weights = weight_store.get_weights(&remapped_filters);
         let remapped_image_weights = weight_store.get_weights(&remapped_image);
 
-        //This is not quite correct, not taking into account Channel;s
         let remapped_filters_matrix = Array::from_shape_vec((remapped_filters.dimensions[0], remapped_filters.dimensions[1]), remapped_filters_weights).unwrap();
         let remapped_image_matrix = Array::from_shape_vec((remapped_image.dimensions[0], remapped_image.dimensions[1]), remapped_image_weights).unwrap();
         //For each filter
@@ -126,12 +179,6 @@ impl Node for Conv2d {
 
         //This is actually the entire work of the backprop, the rest of the code is boilerplate
         let deltas = error_matrix * derivative_of_output_matrix;
-        //create an image for each filter
-        //sum them up then
-        // I think I need to sum each index as 
-        //let next_error = weight_matrix.dot(&deltas.t()).reversed_axes();
-
-        //Convert it into a flat array for storing
         let delta_store : Vec<f32> = deltas.iter().map(|x|*x).collect();
     
         //We need to get the dimensions for the weight token
@@ -139,17 +186,11 @@ impl Node for Conv2d {
         for s in deltas.shape() {
             delta_dimensions.push(*s);
         }
-
         let delta_weight_token = weight_store.add_weights(delta_store, delta_dimensions);
-
-        //TODO: check the actual data type of shape, and see if we can do it better, or if I can just precalucalte this
-        //let next_error_store : Vec<f32> = next_error.iter().map(|x|*x).collect();
-        //let mut next_error_dimenions = vec![];
-       // for s in next_error.shape() {
-       //     next_error_dimenions.push(*s);
-       // }
+        let remapped_output_derivative = Conv2d::stuff(weights, &delta_weight_token, weight_store);
+        
 
         //let next_error_token = weight_store.add_weights(next_error_store, next_error_dimenions);
-        return vec![delta_weight_token];//, next_error_token];
+        return vec![delta_weight_token, remapped_output_derivative];
     }
 }
